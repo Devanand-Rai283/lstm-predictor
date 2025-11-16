@@ -1,457 +1,364 @@
+# app_streamlit.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# Import sklearn
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-
-# Plotly for charts
 import plotly.graph_objects as go
 
-# ============================================================================
-# PAGE CONFIGURATION
-# ============================================================================
+from ml_bilstm import create_windows_multifeature, train_bilstm, load_trained_model
 
-st.set_page_config(
-    page_title="LSTM Stock Price Predictor",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Bi-LSTM + Indicators Predictor", page_icon="📈", layout="wide")
+st.title("📈 Bi-LSTM Stock Predictor with Technical Indicators")
+st.markdown("Uses EMA(20,50), RSI(14), MACD as features and displays indicator charts.")
 
-st.title("📈 LSTM Stock Price Predictor")
-st.markdown("*Simple Stock Price Prediction App*")
-st.markdown("---")
-
-# ============================================================================
-# SIDEBAR: CONFIGURATION
-# ============================================================================
-
+# --------------------
+# Sidebar config
+# --------------------
 st.sidebar.header("⚙️ Configuration")
-
-# Stock symbol input
-stock_symbol = st.sidebar.text_input(
-    "Enter Stock Ticker:",
-    value="AAPL",
-    help="e.g., AAPL, MSFT, GOOGL, TSLA"
-).upper()
-
-# Date range
+stock_symbol = st.sidebar.text_input("Enter Stock Ticker:", value="AAPL").upper()
 st.sidebar.markdown("### Date Range")
-start_date = st.sidebar.date_input(
-    "Start Date:",
-    value=datetime(2020, 1, 1)  # Changed to more recent data
-)
-end_date = st.sidebar.date_input(
-    "End Date:",
-    value=datetime.now()
-)
+start_date = st.sidebar.date_input("Start Date:", value=datetime(2019, 1, 1))
+end_date = st.sidebar.date_input("End Date:", value=datetime.now())
 
-# Model parameters
 st.sidebar.markdown("### Model Parameters")
-window_size = st.sidebar.slider("Window Size (days):", 1, 10, 3)
+window_size = st.sidebar.slider("Window Size (days):", 5, 60, 20)
 train_split = st.sidebar.slider("Training Split (%):", 50, 90, 80)
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+st.sidebar.markdown("### Training Options")
+train_epochs = st.sidebar.slider("Epochs:", 5, 200, 50)
+batch_size = st.sidebar.selectbox("Batch Size:", [8, 16, 32, 64], index=2)
 
-@st.cache_data
+st.sidebar.markdown("### Persistence")
+auto_save = st.sidebar.checkbox("Save trained model to disk", value=True)
+load_existing = st.sidebar.checkbox("Try load existing model (if found)", value=True)
+MODEL_DIR = "models"
+model_path = f"{MODEL_DIR}/{stock_symbol}_bilstm.h5"
+
+# --------------------
+# Indicator functions
+# --------------------
+def compute_ema(series: pd.Series, span: int):
+    return series.ewm(span=span, adjust=False).mean()
+
+def compute_rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(com=period-1, adjust=False).mean()
+    ma_down = down.ewm(com=period-1, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def compute_macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    return macd, macd_signal, macd - macd_signal
+
+
+# --------------------
+# Data fetch & prepare
+# --------------------
 def fetch_stock_data(ticker, start_date, end_date):
-    """Fetch stock data from Yahoo Finance"""
     try:
         df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-        df = df[['Close']].copy()
-        if df.empty:
+        # Flatten MultiIndex columns (e.g. ('Close','AAPL') → 'Close')
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        st.write("🔍 DEBUG: yfinance raw output")
+        st.write(df.head())
+        st.write("Columns:", df.columns.tolist())
+        st.write("Index:", df.index[:5])
+        st.write("Types:", df.dtypes)
+
+        if df is None or df.empty:
             return None
-        return df
+
+        # Convert index
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[df.index.notna()]
+
+        if "Close" not in df.columns:
+            st.write("❌ 'Close' column missing")
+            return None
+
+        # Convert Close to numeric
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+        return df[["Close"]].dropna()
+
     except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
+        st.error(f"Error fetching data: {e}")
         return None
 
-def create_dataset(df, window_size):
-    """Create windowed dataset"""
-    X, y = [], []
-    for i in range(len(df) - window_size):
-        X.append(df[i:(i + window_size), 0])
-        y.append(df[i + window_size, 0])
-    return np.array(X), np.array(y)
+# --------------------
+# FIXED build_features()
+# --------------------
+def build_features(df: pd.DataFrame):
+    df = df.copy()
 
-def simple_moving_average_predictor(X_train, y_train, X_test):
-    """Simple moving average prediction"""
-    avg_price = np.mean(y_train)
-    predictions = []
-    for x in X_test:
-        trend = x[-1] - x[0] if len(x) > 0 else 0
-        pred = avg_price + (trend * 0.5)
-        predictions.append(pred)
-    return np.array(predictions)
+    # Ensure Close is float
+    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
 
+    # Fix datetime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+
+    df = df[df.index.notna()]
+
+    df['Date'] = df.index
+
+    # Compute indicators
+    df['EMA20'] = compute_ema(df['Close'], 20)
+    df['EMA50'] = compute_ema(df['Close'], 50)
+    df['RSI14'] = compute_rsi(df['Close'], 14)
+    macd, signal, _ = compute_macd(df['Close'])
+    df['MACD'] = macd
+    df['MACD_Signal'] = signal
+
+    # Drop rows where indicators could not compute
+    df = df.dropna(subset=['EMA20','EMA50','RSI14','MACD','MACD_Signal'])
+
+    df = df.reset_index(drop=True)
+    return df
+
+# --------------------
+# Train/Test scaling & windows
+# --------------------
+def create_train_test_scaled_multifeature(df_features, train_size, window_size):
+    values = df_features.iloc[:, 1:].values
+    n_rows = values.shape[0]
+
+    scaler = MinMaxScaler()
+    scaler.fit(values[:train_size])
+    scaled = scaler.transform(values)
+
+    X_train, y_train = create_windows_multifeature(scaled[:train_size], window_size)
+
+    if train_size < n_rows:
+        combined = np.vstack([scaled[train_size - window_size:train_size], scaled[train_size:]])
+    else:
+        combined = scaled[train_size - window_size:train_size]
+
+    X_test, y_test = create_windows_multifeature(combined, window_size)
+
+    return scaler, X_train, y_train, X_test, y_test
+
+
+# --------------------
+# Metrics
+# --------------------
 def compute_rmse(y_true, y_pred):
-    """Calculate RMSE"""
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
 def compute_mae(y_true, y_pred):
-    """Calculate MAE"""
     return mean_absolute_error(y_true, y_pred)
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
 
-# Train button
+# --------------------
+# Main action button
+# --------------------
 if st.sidebar.button("🔄 Load Data & Analyze", use_container_width=True):
-    
-    # =====================================================================
-    # STEP 1: FETCH DATA
-    # =====================================================================
-    
-    with st.spinner("📥 Fetching stock data..."):
-        df = fetch_stock_data(stock_symbol, start_date, end_date)
-        
-        if df is None or len(df) < window_size + 50:
-            st.error(f"❌ Not enough data for {stock_symbol}")
+
+    with st.spinner("📥 Fetching data..."):
+        df_raw = fetch_stock_data(stock_symbol, start_date, end_date)
+        if df_raw is None or len(df_raw) < window_size + 60:
+            st.error("Not enough data.")
             st.stop()
-        
-        st.success(f"✓ Loaded {len(df)} records")
-    
-    # =====================================================================
-    # STEP 2: PREPARE DATA
-    # =====================================================================
-    
-    with st.spinner("📊 Preparing data..."):
-        # Get close prices
-        data = df.values
-        
-        # Split train/test
-        train_size = int(len(data) * (train_split / 100))
-        train_data = data[:train_size]
-        test_data = data[train_size:]
-        
-        # Normalize
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_train = scaler.fit_transform(train_data)
-        scaled_test = scaler.transform(test_data)
-        
-        # Create windows
-        X_train, y_train = create_dataset(scaled_train, window_size)
-        X_test, y_test = create_dataset(scaled_test, window_size)
-        
-        st.success(f"✓ Data prepared: Train={len(X_train)}, Test={len(X_test)}")
-    
-    # =====================================================================
-    # STEP 3: MAKE PREDICTIONS
-    # =====================================================================
-    
-    with st.spinner("🔮 Making predictions..."):
-        # Get predictions
-        train_predict_norm = simple_moving_average_predictor(X_train, y_train, X_train)
-        test_predict_norm = simple_moving_average_predictor(X_train, y_train, X_test)
-        
-        # Inverse transform to real prices
-        train_predict = scaler.inverse_transform(train_predict_norm.reshape(-1, 1))
-        y_train_actual = scaler.inverse_transform(y_train.reshape(-1, 1))
-        
-        test_predict = scaler.inverse_transform(test_predict_norm.reshape(-1, 1))
-        y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1))
-        
-        st.success("✓ Analysis complete!")
-    
-    # =====================================================================
-    # STORE IN SESSION
-    # =====================================================================
-    
+        st.success(f"Loaded {len(df_raw)} rows")
+
+    # Build indicators/features
+    with st.spinner("⚙️ Computing indicators..."):
+        df_feat = build_features(df_raw)
+        dates = df_feat['Date']
+        feature_cols = ['Close', 'EMA20', 'EMA50', 'RSI14', 'MACD', 'MACD_Signal']
+        df_features = df_feat[['Date'] + feature_cols].copy()
+        st.success("Indicators computed")
+
+    # Split
+    total_len = len(df_features)
+    train_size = int(total_len * (train_split / 100))
+
+    with st.spinner("🔧 Preparing training/testing data..."):
+        scaler, X_train, y_train, X_test, y_test = create_train_test_scaled_multifeature(
+            df_features, train_size, window_size
+        )
+        n_features = X_train.shape[2]
+        st.success(f"Prepared windows: train {len(X_train)}, test {len(X_test)}")
+
+    # Load model if exists
+    model = None
+    if load_existing:
+        model = load_trained_model(model_path)
+
+    # Train if not loaded
+    if model is None:
+        with st.spinner("🔨 Training model..."):
+            model = train_bilstm(X_train, y_train, window_size, n_features,
+                                 epochs=train_epochs, batch_size=batch_size,
+                                 verbose=1, model_path=model_path if auto_save else None)
+            st.success("Training complete")
+
+    # Predict
+    with st.spinner("🔮 Predicting..."):
+        train_pred_norm = model.predict(X_train, verbose=0)
+        test_pred_norm = model.predict(X_test, verbose=0)
+
+        # inverse transform helper
+        def inverse_close(arr):
+            dummy = np.zeros((len(arr), n_features))
+            dummy[:, 0] = arr.flatten()
+            return scaler.inverse_transform(dummy)[:, 0].reshape(-1, 1)
+
+        train_pred = inverse_close(train_pred_norm)
+        y_train_actual = inverse_close(y_train)
+        test_pred = inverse_close(test_pred_norm)
+        y_test_actual = inverse_close(y_test)
+
+        st.success("Predictions computed")
+
+    # Save session
     st.session_state.data = {
-        'df': df,
-        'train_predict': train_predict,
+        'df_features': df_features,
+        'train_pred': train_pred,
         'y_train_actual': y_train_actual,
-        'test_predict': test_predict,
+        'test_pred': test_pred,
         'y_test_actual': y_test_actual,
         'train_size': train_size,
-        'window_size': window_size,
-        'X_train': X_train,
-        'X_test': X_test
+        'window_size': window_size
     }
     st.session_state.stock_symbol = stock_symbol
 
-# ============================================================================
-# DISPLAY RESULTS
-# ============================================================================
 
+# --------------------
+# Display results
+# --------------------
 if hasattr(st.session_state, 'data'):
-    
+
+    df_features = st.session_state.data['df_features']
+    df_dates = pd.to_datetime(df_features['Date'])
+
     st.markdown("---")
-    
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Stock", st.session_state.stock_symbol)
-    with col2:
-        st.metric("Data Points", len(st.session_state.data['df']))
-    with col3:
-        price_range = st.session_state.data['df']['Close'].values
-        min_price = float(price_range.min())
-        max_price = float(price_range.max())
-        st.metric("Price Range", f"${min_price:.2f} - ${max_price:.2f}")
-    with col4:
-        current_price = st.session_state.data['df']['Close'].values[-1]
-        st.metric("Current Price", f"${current_price.item():.2f}")
-    
-    st.markdown("---")
-    
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📈 Predictions", "🎯 Performance", "📋 Info"])
-    
-    # =====================================================================
-    # TAB 1: PREDICTIONS (FIXED!)
-    # =====================================================================
-    
+    tab1, tab2, tab3 = st.tabs(["📈 Predictions", "🎯 Performance", "📊 Indicators"])
+
+    # -------------------- PREDICTIONS --------------------
     with tab1:
-        st.subheader("Price Predictions: Actual vs Predicted")
-        
-        # Get data
-        df_dates = st.session_state.data['df'].index
-        actual_prices = st.session_state.data['df']['Close'].values
-        
+        st.subheader("Actual vs Predicted")
+
         train_size = st.session_state.data['train_size']
         window_size = st.session_state.data['window_size']
-        
-        train_predict = st.session_state.data['train_predict'].flatten()
-        test_predict = st.session_state.data['test_predict'].flatten()
-        
-        # Create figure - SIMPLE AND CLEAN
+
+        actual = df_features['Close'].values
+        train_pred = st.session_state.data['train_pred'].flatten()
+        test_pred = st.session_state.data['test_pred'].flatten()
+
         fig = go.Figure()
-        
-        # 1. Add ACTUAL PRICE line (BLUE)
+
+        # Actual
         fig.add_trace(go.Scatter(
             x=df_dates,
-            y=actual_prices,
-            name='Actual Price',
-            mode='lines',
-            line=dict(
-                color='blue',
-                width=3
-            ),
-            hovertemplate='<b>Actual</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+            y=actual,
+            mode="lines",
+            name="Actual Price",
+            line=dict(color="blue", width=3)
         ))
-        
-        # 2. Add TRAIN PREDICTIONS (GREEN DASHED)
-        train_start_idx = window_size
-        train_end_idx = train_size
-        train_dates = df_dates[train_start_idx:train_end_idx]
-        
+
+        # Train
+        train_dates = df_dates[window_size:train_size]
         fig.add_trace(go.Scatter(
-            x=train_dates,
-            y=train_predict,
-            name='Train Predictions',
-            mode='lines',
-            line=dict(
-                color='green',
-                width=2,
-                dash='dash'
-            ),
-            hovertemplate='<b>Train Pred</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+            x=train_dates[:len(train_pred)],
+            y=train_pred,
+            mode="lines",
+            name="Train Predictions",
+            line=dict(color="green", width=2, dash="dash")
         ))
-        
-        # 3. Add TEST PREDICTIONS (RED DASHED)
-        test_start_idx = train_size + window_size
-        test_dates = df_dates[test_start_idx:]
-        
+
+        # Test
+        test_dates = df_dates[train_size:][:len(test_pred)]
         fig.add_trace(go.Scatter(
             x=test_dates,
-            y=test_predict,
-            name='Test Predictions',
-            mode='lines',
-            line=dict(
-                color='red',
-                width=2,
-                dash='dash'
-            ),
-            hovertemplate='<b>Test Pred</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+            y=test_pred,
+            mode="lines",
+            name="Test Predictions",
+            line=dict(color="red", width=2, dash="dash")
         ))
-        
-        # Update layout
+
         fig.update_layout(
-            title={
-                'text': f'<b>{st.session_state.stock_symbol} - Actual vs Predicted Prices</b>',
-                'x': 0.5,
-                'xanchor': 'center',
-                'font': {'size': 20, 'color': 'blue'}
-            },
-            xaxis_title='<b>Date</b>',
-            yaxis_title='<b>Price ($)</b>',
-            hovermode='x unified',
             height=600,
-            template='plotly_white',
-            plot_bgcolor='rgba(240, 240, 240, 0.5)',
-            font=dict(size=12),
-            legend=dict(
-                x=0.02,
-                y=0.98,
-                bgcolor='rgba(255, 255, 255, 0.9)',
-                bordercolor='black',
-                borderwidth=2,
-                font=dict(size=12)
-            ),
-            xaxis=dict(
-                showgrid=True,
-                gridwidth=1,
-                gridcolor='lightgray'
-            ),
-            yaxis=dict(
-                showgrid=True,
-                gridwidth=1,
-                gridcolor='lightgray'
-            )
+            xaxis_title="Date",
+            yaxis_title="Price ($)",
+            hovermode="x unified",
+            title=f"{st.session_state.stock_symbol} - Actual vs Predicted"
         )
-        
+
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Show explanation
-        st.success("""
-        ✅ **Chart Explanation:**
-        - 🔵 **BLUE LINE (Solid)** = Actual historical prices (what really happened)
-        - 🟢 **GREEN LINE (Dashed)** = Training predictions (model learning phase)
-        - 🔴 **RED LINE (Dashed)** = Test predictions (model evaluation phase)
-        
-        **How to read:**
-        - Blue line = Ground truth
-        - Green and red lines should follow blue closely = Good model
-        - If they diverge = Model needs improvement
-        """)
-    
-    # =====================================================================
-    # TAB 2: PERFORMANCE
-    # =====================================================================
-    
+
+    # -------------------- PERFORMANCE --------------------
     with tab2:
         st.subheader("Performance Metrics")
-        
-        # Calculate metrics
-        train_rmse = compute_rmse(st.session_state.data['y_train_actual'], st.session_state.data['train_predict'])
-        train_mae = compute_mae(st.session_state.data['y_train_actual'], st.session_state.data['train_predict'])
-        
-        test_rmse = compute_rmse(st.session_state.data['y_test_actual'], st.session_state.data['test_predict'])
-        test_mae = compute_mae(st.session_state.data['y_test_actual'], st.session_state.data['test_predict'])
-        
-        # Display metrics
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("**🟢 Training Set (Model Learning)**")
-            st.metric("RMSE", f"${train_rmse:.2f}")
-            st.metric("MAE", f"${train_mae:.2f}")
-        
-        with col2:
-            st.write("**🔴 Test Set (Model Evaluation)**")
-            st.metric("RMSE", f"${test_rmse:.2f}")
-            st.metric("MAE", f"${test_mae:.2f}")
-        
-        st.markdown("---")
-        
-        # Baseline comparison
-        st.write("**Baseline Comparison**")
-        
-        # Naive baseline
-        naive_pred = np.concatenate([[st.session_state.data['y_test_actual'][0]], st.session_state.data['y_test_actual'][:-1]])
-        naive_mae = compute_mae(st.session_state.data['y_test_actual'], naive_pred)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Naive Baseline MAE", f"${naive_mae:.2f}")
-        with col2:
-            st.metric("Model MAE", f"${test_mae:.2f}")
-        with col3:
-            improvement = ((naive_mae - test_mae) / naive_mae) * 100
-            if improvement > 0:
-                st.metric("Improvement", f"✅ {improvement:.1f}%")
-            else:
-                st.metric("Improvement", f"❌ {improvement:.1f}%")
-    
-    # =====================================================================
-    # TAB 3: INFO
-    # =====================================================================
-    
+
+        train_rmse = compute_rmse(st.session_state.data['y_train_actual'],
+                                  st.session_state.data['train_pred'])
+        train_mae = compute_mae(st.session_state.data['y_train_actual'],
+                                 st.session_state.data['train_pred'])
+
+        test_rmse = compute_rmse(st.session_state.data['y_test_actual'],
+                                 st.session_state.data['test_pred'])
+        test_mae = compute_mae(st.session_state.data['y_test_actual'],
+                                st.session_state.data['test_pred'])
+
+        st.metric("Train RMSE", f"{train_rmse:.2f}")
+        st.metric("Test RMSE", f"{test_rmse:.2f}")
+        st.metric("Train MAE", f"{train_mae:.2f}")
+        st.metric("Test MAE", f"{test_mae:.2f}")
+
+    # -------------------- INDICATORS --------------------
     with tab3:
-        st.subheader("About This App")
-        
-        with st.expander("📖 How it works", expanded=True):
-            st.write("""
-            **Process:**
-            1. Fetches historical stock data from Yahoo Finance
-            2. Normalizes prices to 0-1 range
-            3. Creates 3-day rolling windows
-            4. Splits into 80% training, 20% testing
-            5. Makes predictions using simple moving average
-            6. Evaluates accuracy on unseen test data
-            
-            **Why this matters:**
-            - Training data: Shows if model can learn patterns
-            - Test data: Shows if model can predict NEW data
-            - Both should be close to actual prices = Good model
-            """)
-        
-        with st.expander("📊 Metrics Explained"):
-            st.write("""
-            **RMSE (Root Mean Squared Error)**
-            - Average prediction error in dollars
-            - Penalizes large errors more
-            - Lower is better
-            
-            **MAE (Mean Absolute Error)**
-            - Average absolute error in dollars
-            - More interpretable than RMSE
-            - $5 MAE = predictions off by $5 on average
-            
-            **Example:**
-            - MAE = $2 means predictions are ~$2 off
-            - RMSE = $3 means some predictions are worse
-            """)
-        
-        with st.expander("⚠️ Important Disclaimer"):
-            st.write("""
-            ❌ **DO NOT use this for real trading!**
-            
-            Reasons:
-            - Past performance ≠ future results
-            - Markets are affected by unpredictable events
-            - This simple model can't capture everything
-            - Use only as ONE signal in a broader strategy
-            
-            ✅ **Better approach:**
-            - Combine with other technical indicators
-            - Include fundamental analysis
-            - Use proper risk management
-            - Consult financial advisors
-            """)
+        st.subheader("Technical Indicators")
+
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=df_dates, y=df_features['Close'], name="Close"))
+        fig1.add_trace(go.Scatter(x=df_dates, y=df_features['EMA20'], name="EMA20"))
+        fig1.add_trace(go.Scatter(x=df_dates, y=df_features['EMA50'], name="EMA50"))
+        fig1.update_layout(title="Price + EMA", height=350)
+        st.plotly_chart(fig1, use_container_width=True)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df_dates, y=df_features['RSI14'], name="RSI14"))
+        fig2.update_layout(title="RSI(14)", height=250, yaxis=dict(range=[0, 100]))
+        st.plotly_chart(fig2, use_container_width=True)
+                # MACD
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=df_dates, y=df_features['MACD'],
+            name="MACD", line=dict(color="black")
+        ))
+        fig3.add_trace(go.Scatter(
+            x=df_dates, y=df_features['MACD_Signal'],
+            name="Signal", line=dict(color="red")
+        ))
+        fig3.update_layout(title="MACD & Signal", height=300)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("✅ Indicators shown above are used as input features for the Bi-LSTM model.")
 
 else:
-    st.info("👈 **Configure parameters and click 'Load Data & Analyze'** to get started!")
-    
-    with st.expander("ℹ️ How to use this app", expanded=True):
+    st.info("👈 Configure parameters and click **Load Data & Analyze** to run the model.")
+    with st.expander("ℹ️ Info"):
         st.write("""
-        **Steps:**
-        1. Enter stock ticker (AAPL, MSFT, GOOGL, etc.)
-        2. Set date range (default: last 5 years)
-        3. Set window size (default: 3 days)
-        4. Click "Load Data & Analyze"
-        5. Wait for analysis
-        6. View chart and metrics
-        
-        **Tips:**
-        - Use 2-5 years of data for best results
-        - Window size 3-10 days works well
-        - More data = potentially better predictions
+        This app:
+        - Downloads stock data from Yahoo Finance  
+        - Computes EMA20, EMA50, RSI(14), MACD, Signal  
+        - Trains a Bi-LSTM deep learning model  
+        - Displays predictions & indicators  
         """)
-
-st.markdown("---")
-st.markdown("""
-**Stock Price Prediction | Moving Average Model**
-- 🔵 Blue = Actual | 🟢 Green = Train | 🔴 Red = Test
-- Shows: Actual prices vs Model predictions
-""")
