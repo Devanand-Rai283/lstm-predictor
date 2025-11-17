@@ -1,6 +1,7 @@
 # lstm-predictor
 "LSTM Stock &amp; Crypto Predictor"
-Abstract?Overview of this Project:
+
+Overview of this Project:
 The model developed is founded on Long ShortTerm Memory (LSTM) on memory architecture. Prior to the
 training phase, the data underwent comprehensive preprocessing,
 normalization, and exploratory data analysis (EDA). When assessed using Google stock data, the model achieved a remarkable
